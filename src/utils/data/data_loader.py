@@ -5,10 +5,10 @@ def load_all_datasets(streaming=True):
     Load and unify all 4 manim datasets into a single stream.
 
     Total: 7,622 training examples
-    - generaleoley/manim-codegen: 1,622 examples (medium complexity)
-    - bespokelabs/bespoke-manim: 1,000 examples (highest quality, 99.5% validated)
-    - thanhkt/manim_code: 4,400 examples (largest dataset)
-    - Edoh/manim_python: 599 examples (basic, concise)
+    - generaleoley/manim-codegen: 1,622 examples
+    - bespokelabs/bespoke-manim: 1,000 examples
+    - thanhkt/manim_code: 4,400 examples
+    - Edoh/manim_python: 599 examples
 
     Args:
         streaming: If True, use streaming mode (recommended for Modal GPUs)
