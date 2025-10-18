@@ -1,4 +1,7 @@
 from datasets import load_dataset, interleave_datasets
+import torch
+from torch.utils.data import IterableDataset, DataLoader
+import torch.distributed as dist
 
 def load_all_datasets(streaming=True):
     """
@@ -79,3 +82,68 @@ def load_test_dataset(streaming=True):
     test_ds = test_ds.remove_columns([col for col in test_ds.column_names if col not in ["prompt", "code", "source"]])
 
     return test_ds
+
+class StreamingManimDataset(IterableDataset):
+    """
+    Wraps huggingface streaming dataset for PyTorch dataloader with automatic distributed sharding
+    """
+
+    def __init__(self, hf_dataset, tokenizer, max_length=2048):
+        self.dataset = hf_dataset
+        self.tokenizer = tokenizer
+        self.max_length = max_length
+
+        if self.tokenizer.pad_token is None:
+            self.tokenizer.pad_token = self.tokenizer.eos_token
+
+        if dist.is_initialized():
+            self.rank = dist.get_rank()
+            self.world_size = dist.get_world_size()
+        else:
+            # Single GPU fallback
+            self.rank = 0
+            self.world_size = 1
+
+    def __iter__(self):
+        for idx, example in enumerate(self.dataset):
+            if idx % self.world_size != self.rank:
+                continue
+
+            text = f"### Instruction:\n{example['prompt']}\n\n### Response:\n{example['code']}"
+
+            encoded = self.tokenizer(
+                text,
+                max_length=self.max_length,
+                truncation=True,
+                padding="max_length",
+                return_tensors="pt"
+            )
+            yield{
+                "input_ids": encoded["input_ids"].squeeze(0),
+                "attention_mask": encoded["attention_mask"].squeeze(0),
+                "labels": encoded["input_ids"].squeeze(0),
+            }
+
+def get_dataloader(tokenizer, batch_size=4, max_length=2048, streaming=True, num_workers=0):
+    """
+    Get PyTorch dataloader with automatic sharding for FSDP.
+
+    Args:
+        tokenizer: HuggingFace tokenizer
+        batch_size: Batch size per GPU
+        max_length: Max sequence length
+        streaming: Whether to use streaming mode
+        num_workers: Number of data loading workers (must be 0 for streaming)
+
+    Returns:
+        PyTorch DataLoader with automatic rank-based sharding
+    """
+    hf_dataset = load_all_datasets(streaming=streaming)
+    dataset = StreamingManimDataset(hf_dataset, tokenizer, max_length)
+    loader = DataLoader(
+        dataset,
+        batch_size=batch_size,
+        num_workers=num_workers,
+        pin_memory=True,
+    )
+    return loader
