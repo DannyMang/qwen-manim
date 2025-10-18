@@ -1,0 +1,17 @@
+torch>=2.4.0
+transformers>=4.40.0
+
+# Data
+datasets>=2.18.0
+
+packaging  # required by torch.distributed
+
+# Logging & Monitoring
+wandb>=0.16.0
+
+# Modal
+modal>=0.64.0
+
+# Utilities
+numpy
+tqdm

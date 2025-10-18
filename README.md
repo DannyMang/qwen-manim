@@ -1,5 +1,7 @@
 notes
 
+text to [manim](https://github.com/3b1b/manim) project by dannymang
+
 data:
 
 https://huggingface.co/datasets/generaleoley/manim-codegen
