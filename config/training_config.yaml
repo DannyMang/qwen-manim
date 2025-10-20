@@ -37,6 +37,9 @@ training:
   adam_beta2: 0.999
   adam_epsilon: 1.0e-8
 
+  # Checkpointing
+  checkpoint_dir: "/checkpoints"  # Modal volume mount point
+
 fsdp:
   # From FSDPConfig dataclass
   sharding_strategy: "FULL_SHARD"
@@ -67,11 +70,11 @@ logging:
 
   # Profiling frequency
   profile_every_n_steps: 100
-  profile_enabled: true
+  profile_enabled: false  # Set to true to enable profiling
 
   # Checkpointing
-  save_every_n_steps: 500
-  save_total_limit: 3 # Keep only 3 checkpoints
+  save_every_n_epochs: 1  # Save after each epoch
+  keep_last_n_checkpoints: 3  # Keep only last 3 checkpoints
 
   # WandB settings
   wandb:

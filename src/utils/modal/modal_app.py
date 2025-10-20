@@ -12,6 +12,8 @@ image = (
         "packaging",
         "numpy",
         "tqdm",
+        "python-dotenv>=1.0.0",
+        "PyYAML>=6.0.0",
     )
 )
 
@@ -28,4 +30,18 @@ volume = modal.Volume.from_name("manimbot-checkpoints", create_if_missing=True)
     retries=3,
 )
 def train():
-    pass
+    """
+    Main training function for Modal.
+    Runs FSDP training on 8x A100 GPUs.
+    """
+    import os
+    import sys
+
+    # Add project root to path
+    sys.path.insert(0, "/root")
+
+    # Import and run training
+    from src.training.train import train as train_fn
+
+    # Run training with config
+    train_fn(config_path="/root/config/training_config.yaml")

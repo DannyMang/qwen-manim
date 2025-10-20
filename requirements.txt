@@ -1,16 +1,22 @@
+# Core ML
 torch>=2.9.0
 transformers>=4.40.0
 
 # Data
 datasets>=2.18.0
 
-packaging  # required by torch.distributed
+# Required by torch.distributed
+packaging
 
 # Logging & Monitoring
 wandb>=0.16.0
 
 # Modal
 modal>=0.64.0
+
+# Configuration
+python-dotenv>=1.0.0
+PyYAML>=6.0.0
 
 # Utilities
 numpy

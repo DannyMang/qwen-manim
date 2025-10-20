@@ -10,6 +10,7 @@ from torch.distributed.fsdp import (
     CPUOffload,
 )
 from torch.distributed.fsdp.wrap import transformer_auto_wrap_policy
+from src.training.fsdp_utils import apply_fsdp_checkpointing
 
 @dataclass
 class FSDPConfig:
@@ -56,7 +57,9 @@ def get_qwen3next_auto_wrap_policy():
         transformer_layer_cls={Qwen3NextDecoderLayer},
     )
 
- def get_mixed_precision_policy(config: FSDPConfig) -> MixedPrecision | None:
+
+def get_mixed_precision_policy(config: FSDPConfig) -> MixedPrecision | None:
+    """Create mixed precision policy for FSDP."""
     if not config.use_mixed_precision:
         return None
 

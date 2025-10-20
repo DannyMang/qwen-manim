@@ -1,12 +1,16 @@
 import os
 import sys
+import time
 import yaml
-from typing import Any
+from pathlib import Path
+from typing import Any, Optional
 import torch
 import torch.distributed as dist
 from dotenv import load_dotenv
+from tqdm import tqdm
 from torch.distributed.fsdp import FullyShardedDataParallel as FSDP
 from torch.distributed.fsdp import StateDictType, FullStateDictConfig
+from torch.profiler import profile, ProfilerActivity, schedule
 from transformers import (
     AutoModelForCausalLM,
     AutoTokenizer,
@@ -19,6 +23,7 @@ load_dotenv()
 from src.training.fsdp_config import FSDPConfig, setup_fsdp_model
 from src.training.callbacks import WandbLogger, TrainingMetrics
 from src.utils.data.data_loader import get_dataloader
+from src.utils.checkpoint import save_checkpoint, load_checkpoint
 
 def setup_distributed():
     """
@@ -168,37 +173,54 @@ def train_one_epoch(
     scheduler,
     epoch: int,
     config: dict,
-    logger,
+    logger: Optional[WandbLogger],
     metrics: TrainingMetrics,
     rank: int,
+    profiler: Optional = None,
 ) -> float:
     """
-    Train for one epoch w/ gradient accumulation + mixed precision
+    Train for one epoch w/ gradient accumulation + mixed precision.
+
+    Args:
+        model: FSDP-wrapped model
+        dataloader: Training dataloader
+        optimizer: Optimizer instance
+        scheduler: LR scheduler
+        epoch: Current epoch (0-indexed)
+        config: Training configuration
+        logger: WandB logger (optional)
+        metrics: Metrics tracker
+        rank: Process rank
+        profiler: PyTorch profiler (optional)
+
+    Returns:
+        Average epoch loss
     """
     model.train()
-    toal_loss = 0.0
+    total_loss = 0.0
     num_batches = 0
     gradient_accumulation_steps = config["training"]["gradient_accumulation_steps"]
     max_grad_norm = config["training"]["max_grad_norm"]
     log_interval = config["logging"]["log_every_n_steps"]
-    global_step = epoch * len(dataloader)//gradient_accumulation_steps
+    global_step = epoch * len(dataloader) // gradient_accumulation_steps
 
-    # do we need this?
+    # Progress bar on rank 0 only
     if rank == 0:
         pbar = tqdm(
-            total=len(dataloader),
+            total=len(dataloader) // gradient_accumulation_steps,
             desc=f"Epoch {epoch+1}",
             disable=False,
         )
 
     optimizer.zero_grad()
 
-    for batch_idx, batch in enumerate(dataloder):
-        start_time = time.time()
+    for batch_idx, batch in enumerate(dataloader):
+        # Move batch to GPU
         input_ids = batch["input_ids"].cuda(non_blocking=True)
         attention_mask = batch["attention_mask"].cuda(non_blocking=True)
         labels = batch["labels"].cuda(non_blocking=True)
 
+        # Forward pass
         outputs = model(
             input_ids=input_ids,
             attention_mask=attention_mask,
@@ -206,13 +228,17 @@ def train_one_epoch(
         )
 
         loss = outputs.loss
-        loss = loss/gradient_accumulation_steps
-        loss.backwards()
+        loss = loss / gradient_accumulation_steps
+
+        # Backward pass
+        loss.backward()
 
         total_loss += loss.item() * gradient_accumulation_steps
         num_batches += 1
 
+        # Optimizer step after accumulating gradients
         if (batch_idx + 1) % gradient_accumulation_steps == 0:
+            # Gradient clipping
             if max_grad_norm > 0:
                 torch.nn.utils.clip_grad_norm_(
                     model.parameters(),
@@ -223,44 +249,49 @@ def train_one_epoch(
             scheduler.step()
             optimizer.zero_grad()
 
-            global_step+=1
+            global_step += 1
 
-            if rank == 0 and global_step % log_interval == 0:
+            # Logging (rank 0 only)
+            if rank == 0:
                 avg_loss = total_loss / num_batches
 
-                # Log to WandB
-                if logger:
-                    metrics.log_step_metrics(
-                        logger=logger,
-                        loss=avg_loss,
-                        model=model,
-                        optimizer=optimizer,
-                        step=global_step,
-                    )
+                if global_step % log_interval == 0:
+                    # Log to WandB
+                    if logger:
+                        metrics.log_step_metrics(
+                            logger=logger,
+                            loss=avg_loss,
+                            model=model,
+                            optimizer=optimizer,
+                            step=global_step,
+                        )
 
+                # Update progress bar
                 pbar.set_postfix({
                     "loss": f"{avg_loss:.4f}",
                     "lr": f"{scheduler.get_last_lr()[0]:.2e}",
                     "step": global_step,
                 })
+                pbar.update(1)
 
-        if rank == 0:
-            pbar.update(1)
-
+        # Profiler step (if enabled)
         if profiler is not None:
             profiler.step()
 
+        # Periodic barrier to keep ranks synchronized
         if batch_idx % 100 == 0:
             dist.barrier()
 
     if rank == 0:
         pbar.close()
 
-    avg_epoch_loss = total_loss/num_batches
+    # Calculate epoch average loss across all ranks
+    avg_epoch_loss = total_loss / num_batches
     loss_tensor = torch.tensor([avg_epoch_loss]).cuda()
     dist.all_reduce(loss_tensor, op=dist.ReduceOp.AVG)
-    avg.epoch_loss = loss_tensor.item()
+    avg_epoch_loss = loss_tensor.item()
 
+    # Log epoch metrics (rank 0 only)
     if rank == 0 and logger:
         metrics.log_epoch_metrics(
             logger=logger,
@@ -271,128 +302,205 @@ def train_one_epoch(
 
     return avg_epoch_loss
 
-def save_checkpoint(
-    model: FSDP,
-    optimizer: torch.optim.Optimzer,
-    scheduler,
-    epoch: int,
-    global_step: int,
-    checkpoint_dir: str,
-    rank: int,
-    config: dict,
-) -> None:
+
+def train(config_path: str = "config/training_config.yaml"):
     """
-    Save FSDP checkpoint
-    FSDP checkpointing options:
-    1. FULL_STATE_DICT: Full model on rank 0
-    2. SHARDED_STATE_DICT: Distributed checkpoint
+    Main training function with FSDP, profiling, and checkpointing.
+
+    This orchestrates:
+    1. Distributed setup
+    2. Model/optimizer initialization
+    3. Data loading
+    4. Training loop with epochs
+    5. Checkpointing
+    6. Profiling (optional)
+    7. Cleanup
     """
+    rank, world_size, local_rank = setup_distributed()
 
-    if rank == 0:
-        print(f"\nSaving checkpoint at epoch {epoch+1}, step {global_step}...")
-
-    checkpoint_dir = Path(checkpoint_dir)
-    checkpoint_dir.mkdir(parents=True, exist_ok = True)
-
-    save_policy = FullStateDictConfig(
-        offload_to_cpu=True,
-        rank0_only=True,
-    )
-
-    optim_policy = FullOptimStateDictConfig(
-        offload_to_cpu=True,
-        rank0_only=True,
-    )
-
-    with FSDP.state_dict_type(
-        model,
-        StateDictType.FULL_STATE_DICT,
-        save_policy,
-        optim_policy,
-    ):
-        model_state_dict = model.state_dict()
-        optim_state_dict = FSDP.optim_state_dict(model, optimizer)
+    try:
+        config = load_config(config_path)
 
         if rank == 0:
-            checkpoint = {
-                "epoch": epoch,
-                "global_step": global_step,
-                "model_state_dict": model_state_dict,
-                "optimizer_state_dict": optim_state_dict,
-                "scheduler_state_dict": scheduler.state_dict(),
-                "config": config,
-            }
+            print("\n" + "="*80)
+            print("Starting FSDP Training - Qwen3-Next-80B-A3B")
+            print("="*80)
+            print(f"World size: {world_size}")
+            print(f"Model: {config['model']['name']}")
+            print(f"Epochs: {config['training']['num_epochs']}")
+            print(f"Batch size per GPU: {config['training']['batch_size']}")
+            print(f"Gradient accumulation: {config['training']['gradient_accumulation_steps']}")
+            effective_batch = (
+                config['training']['batch_size'] *
+                world_size *
+                config['training']['gradient_accumulation_steps']
+            )
+            print(f"Effective batch size: {effective_batch}")
+            print("="*80 + "\n")
 
-            checkpoint_path = checkpoint_dir / f"checkpoint_epoch_{epoch+1}.pt"
-            torch.save(checkpoint, checkpoint_path)
-            print(f"✅ Checkpoint saved: {checkpoint_path}")
+        model, optimizer, tokenizer = setup_model_and_optimizer(config, rank)
 
+        if rank == 0:
+            print("Setting up data loader...")
+
+        dataloader = get_dataloader(
+            tokenizer=tokenizer,
+            batch_size=config["training"]["batch_size"],
+            max_length=config["model"]["max_length"],
+            streaming=True,
+            num_workers=0,  # Must be 0 for streaming
+        )
+
+        if rank == 0:
+            print(f"✅ Data loader ready")
+
+        num_training_steps = (
+            len(dataloader) //
+            config["training"]["gradient_accumulation_steps"] *
+            config["training"]["num_epochs"]
+        )
+
+        scheduler = get_cosine_schedule_with_warmup(
+            optimizer,
+            num_warmup_steps=config["training"]["warmup_steps"],
+            num_training_steps=num_training_steps,
+        )
+
+        if rank == 0:
+            print(f"✅ Scheduler ready ({num_training_steps} steps)")
+
+        # Setup WandB logging (rank 0 only)
+        logger = None
+        if rank == 0:
+            logger = WandbLogger(
+                project=config["logging"]["wandb"]["project"],
+                name=config["logging"]["wandb"]["name"],
+                config=config,
+                tags=config["logging"]["wandb"].get("tags", []),
+            )
+            print("✅ WandB initialized")
+
+        metrics = TrainingMetrics(
+            log_grad_norm=True,
+            grad_norm_freq=config["logging"].get("grad_norm_freq", 100),
+        )
+
+        profiler = None
+        if config.get("profiling", {}).get("enabled", False):
+            if rank == 0:
+                print("Setting up PyTorch profiler...")
+
+            profiler = profile(
+                activities=[ProfilerActivity.CPU, ProfilerActivity.CUDA],
+                schedule=schedule(
+                    wait=1,
+                    warmup=2,
+                    active=3,
+                    repeat=2,
+                ),
+                on_trace_ready=torch.profiler.tensorboard_trace_handler(
+                    './profiler_logs'
+                ),
+                record_shapes=True,
+                profile_memory=True,
+                with_stack=True,
+            )
+            profiler.start()
+
+            if rank == 0:
+                print("✅ Profiler enabled")
+
+        # Load checkpoint if resuming
+        start_epoch = 0
+        resume_from = config.get("training", {}).get("resume_from_checkpoint", None)
+        if resume_from and Path(resume_from).exists():
+            start_epoch, _ = load_checkpoint(
+                resume_from,
+                model,
+                optimizer,
+                scheduler,
+                rank,
+            )
+
+        if rank == 0:
+            print("\n" + "="*80)
+            print("Starting training loop")
+            print("="*80 + "\n")
+
+        best_loss = float('inf')
+
+        for epoch in range(start_epoch, config["training"]["num_epochs"]):
+            if rank == 0:
+                print(f"\n{'='*80}")
+                print(f"Epoch {epoch+1}/{config['training']['num_epochs']}")
+                print(f"{'='*80}\n")
+
+            # Train one epoch
+            avg_loss = train_one_epoch(
+                model=model,
+                dataloader=dataloader,
+                optimizer=optimizer,
+                scheduler=scheduler,
+                epoch=epoch,
+                config=config,
+                logger=logger,
+                metrics=metrics,
+                rank=rank,
+                profiler=profiler,
+            )
+
+            if rank == 0:
+                print(f"\n✅ Epoch {epoch+1} complete - Average loss: {avg_loss:.4f}")
+
+            # Save checkpoint
+            is_best = avg_loss < best_loss
             if is_best:
-                best_path = checkpoint_dir / "checkpoint_best.pt"
-                torch.save(checkpoint, best_path)
-                print(f"✅ Best checkpoint saved: {best_path}")
+                best_loss = avg_loss
 
-            keep_last_n = config["logging"].get("keep_last_n_checkpoints", 3)
-            cleanup_old_checkpoints(checkpoint_dir, keep_last_n)
+            save_every_n = config["logging"].get("save_every_n_epochs", 1)
+            if (epoch + 1) % save_every_n == 0:
+                global_step = (epoch + 1) * len(dataloader) // config["training"]["gradient_accumulation_steps"]
+                save_checkpoint(
+                    model=model,
+                    optimizer=optimizer,
+                    scheduler=scheduler,
+                    epoch=epoch,
+                    global_step=global_step,
+                    checkpoint_dir=config["training"].get("checkpoint_dir", "./checkpoints"),
+                    rank=rank,
+                    config=config,
+                    is_best=is_best,
+                )
 
-    dist,barrier()
+        # Stop profiler
+        if profiler is not None:
+            profiler.stop()
+            if rank == 0:
+                print("✅ Profiler stopped")
 
-def cleanup_old_checkpoints(checkpoint_dir: Path, keep_last_n: int):
-    """Keep only the last N checkpoints to save disk space."""
-    checkpoints = sorted(
-        checkpoint_dir.glob("checkpoint_epoch_*.pt"),
-        key=lambda p: p.stat().st_mtime,
-    )
+        # Finish WandB
+        if rank == 0 and logger:
+            logger.finish()
+            print("✅ WandB finished")
 
-    for checkpoint in checkpoints[:-keep_last_n]:
-        checkpoint.unlink()
-        print(f"Removed old checkpoint: {checkpoint}")
+        if rank == 0:
+            print("\n" + "="*80)
+            print("✅ Training complete!")
+            print("="*80 + "\n")
 
-def load_checkpoint(
-    checkpoint_path: str,
-    model: FSDP,
-    optimizer: torch.optim.Optimizer,
-    scheduler,
-    rank: int,
-) -> tuple[int, int]:
-    """
-    Load checkpoint for resuming training
+    except Exception as e:
+        print(f"\n❌ [Rank {rank}] Training failed with error: {e}")
+        import traceback
+        traceback.print_exc()
+        raise
 
-    Returns
-    (epoch, global_step)
-    """
-    checkpoint = torch.load(checkpoint_path, map_location="cpu")
-
-    load_policy = FullStateDictConfig(
-        offload_to_cpu=True,
-        rank0_only=False
-    )
-
-    with FSDP.state_dict_type(model, StateDictType.FULL_STATE_DICT, load_policy):
-        model.load_state_dict(checkpoint["model_save_dict"])
-
-    optim_state = FSDP.optim_state_dict_to_load(
-        model,
-        optimizer,
-        checkpoint["optimizer_state_dict"],
-    )
-    optimizer.load_state_dict(optim_state)
-
-    scheduler.load_state_dict(checkpoint["scheduler_state_dict"])
-
-    epoch = checkpoint["epoch"]
-    global_step = checkpoint["global_step"]
-
-    if rank == 0:
-        print(f"✅ Checkpoint loaded: resuming from epoch {epoch+1}, step {global_step}")
-
-    dist.barrier()
-    return epoch, global_step
-
-
-def train():
-    pass
+    finally:
+        cleanup_distributed()
+        if rank == 0:
+            print("Distributed training cleaned up")
 
 
 if __name__ == "__main__":
-    train()
+    import sys
+    config_path = sys.argv[1] if len(sys.argv) > 1 else "config/training_config.yaml"
+    train(config_path)
