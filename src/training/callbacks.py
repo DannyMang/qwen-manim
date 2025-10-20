@@ -3,6 +3,10 @@ from typing import Any
 import torch
 import torch.distributed as dist
 import wandb
+from dotenv import load_dotenv
+
+# Load environment variables from .env file
+load_dotenv()
 
 
 class WandbLogger:
