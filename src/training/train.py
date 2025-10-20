@@ -273,7 +273,7 @@ def train_one_epoch(
 
 def save_checkpoint(
     model: FSDP,
-    optimizer,
+    optimizer: torch.optim.Optimzer,
     scheduler,
     epoch: int,
     global_step: int,
@@ -281,17 +281,113 @@ def save_checkpoint(
     rank: int,
     config: dict,
 ) -> None:
-    pass
+    """
+    Save FSDP checkpoint
+    FSDP checkpointing options:
+    1. FULL_STATE_DICT: Full model on rank 0
+    2. SHARDED_STATE_DICT: Distributed checkpoint
+    """
 
+    if rank == 0:
+        print(f"\nSaving checkpoint at epoch {epoch+1}, step {global_step}...")
+
+    checkpoint_dir = Path(checkpoint_dir)
+    checkpoint_dir.mkdir(parents=True, exist_ok = True)
+
+    save_policy = FullStateDictConfig(
+        offload_to_cpu=True,
+        rank0_only=True,
+    )
+
+    optim_policy = FullOptimStateDictConfig(
+        offload_to_cpu=True,
+        rank0_only=True,
+    )
+
+    with FSDP.state_dict_type(
+        model,
+        StateDictType.FULL_STATE_DICT,
+        save_policy,
+        optim_policy,
+    ):
+        model_state_dict = model.state_dict()
+        optim_state_dict = FSDP.optim_state_dict(model, optimizer)
+
+        if rank == 0:
+            checkpoint = {
+                "epoch": epoch,
+                "global_step": global_step,
+                "model_state_dict": model_state_dict,
+                "optimizer_state_dict": optim_state_dict,
+                "scheduler_state_dict": scheduler.state_dict(),
+                "config": config,
+            }
+
+            checkpoint_path = checkpoint_dir / f"checkpoint_epoch_{epoch+1}.pt"
+            torch.save(checkpoint, checkpoint_path)
+            print(f"✅ Checkpoint saved: {checkpoint_path}")
+
+            if is_best:
+                best_path = checkpoint_dir / "checkpoint_best.pt"
+                torch.save(checkpoint, best_path)
+                print(f"✅ Best checkpoint saved: {best_path}")
+
+            keep_last_n = config["logging"].get("keep_last_n_checkpoints", 3)
+            cleanup_old_checkpoints(checkpoint_dir, keep_last_n)
+
+    dist,barrier()
+
+def cleanup_old_checkpoints(checkpoint_dir: Path, keep_last_n: int):
+    """Keep only the last N checkpoints to save disk space."""
+    checkpoints = sorted(
+        checkpoint_dir.glob("checkpoint_epoch_*.pt"),
+        key=lambda p: p.stat().st_mtime,
+    )
+
+    for checkpoint in checkpoints[:-keep_last_n]:
+        checkpoint.unlink()
+        print(f"Removed old checkpoint: {checkpoint}")
 
 def load_checkpoint(
     checkpoint_path: str,
     model: FSDP,
-    optimizer,
+    optimizer: torch.optim.Optimizer,
     scheduler,
     rank: int,
 ) -> tuple[int, int]:
-    pass
+    """
+    Load checkpoint for resuming training
+
+    Returns
+    (epoch, global_step)
+    """
+    checkpoint = torch.load(checkpoint_path, map_location="cpu")
+
+    load_policy = FullStateDictConfig(
+        offload_to_cpu=True,
+        rank0_only=False
+    )
+
+    with FSDP.state_dict_type(model, StateDictType.FULL_STATE_DICT, load_policy):
+        model.load_state_dict(checkpoint["model_save_dict"])
+
+    optim_state = FSDP.optim_state_dict_to_load(
+        model,
+        optimizer,
+        checkpoint["optimizer_state_dict"],
+    )
+    optimizer.load_state_dict(optim_state)
+
+    scheduler.load_state_dict(checkpoint["scheduler_state_dict"])
+
+    epoch = checkpoint["epoch"]
+    global_step = checkpoint["global_step"]
+
+    if rank == 0:
+        print(f"✅ Checkpoint loaded: resuming from epoch {epoch+1}, step {global_step}")
+
+    dist.barrier()
+    return epoch, global_step
 
 
 def train():
