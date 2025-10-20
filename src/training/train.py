@@ -172,8 +172,104 @@ def train_one_epoch(
     metrics: TrainingMetrics,
     rank: int,
 ) -> float:
-    pass
+    """
+    Train for one epoch w/ gradient accumulation + mixed precision
+    """
+    model.train()
+    toal_loss = 0.0
+    num_batches = 0
+    gradient_accumulation_steps = config["training"]["gradient_accumulation_steps"]
+    max_grad_norm = config["training"]["max_grad_norm"]
+    log_interval = config["logging"]["log_every_n_steps"]
+    global_step = epoch * len(dataloader)//gradient_accumulation_steps
 
+    # do we need this?
+    if rank == 0:
+        pbar = tqdm(
+            total=len(dataloader),
+            desc=f"Epoch {epoch+1}",
+            disable=False,
+        )
+
+    optimizer.zero_grad()
+
+    for batch_idx, batch in enumerate(dataloder):
+        start_time = time.time()
+        input_ids = batch["input_ids"].cuda(non_blocking=True)
+        attention_mask = batch["attention_mask"].cuda(non_blocking=True)
+        labels = batch["labels"].cuda(non_blocking=True)
+
+        outputs = model(
+            input_ids=input_ids,
+            attention_mask=attention_mask,
+            labels=labels,
+        )
+
+        loss = outputs.loss
+        loss = loss/gradient_accumulation_steps
+        loss.backwards()
+
+        total_loss += loss.item() * gradient_accumulation_steps
+        num_batches += 1
+
+        if (batch_idx + 1) % gradient_accumulation_steps == 0:
+            if max_grad_norm > 0:
+                torch.nn.utils.clip_grad_norm_(
+                    model.parameters(),
+                    max_grad_norm,
+                )
+
+            optimizer.step()
+            scheduler.step()
+            optimizer.zero_grad()
+
+            global_step+=1
+
+            if rank == 0 and global_step % log_interval == 0:
+                avg_loss = total_loss / num_batches
+
+                # Log to WandB
+                if logger:
+                    metrics.log_step_metrics(
+                        logger=logger,
+                        loss=avg_loss,
+                        model=model,
+                        optimizer=optimizer,
+                        step=global_step,
+                    )
+
+                pbar.set_postfix({
+                    "loss": f"{avg_loss:.4f}",
+                    "lr": f"{scheduler.get_last_lr()[0]:.2e}",
+                    "step": global_step,
+                })
+
+        if rank == 0:
+            pbar.update(1)
+
+        if profiler is not None:
+            profiler.step()
+
+        if batch_idx % 100 == 0:
+            dist.barrier()
+
+    if rank == 0:
+        pbar.close()
+
+    avg_epoch_loss = total_loss/num_batches
+    loss_tensor = torch.tensor([avg_epoch_loss]).cuda()
+    dist.all_reduce(loss_tensor, op=dist.ReduceOp.AVG)
+    avg.epoch_loss = loss_tensor.item()
+
+    if rank == 0 and logger:
+        metrics.log_epoch_metrics(
+            logger=logger,
+            epoch=epoch,
+            avg_loss=avg_epoch_loss,
+            step=global_step,
+        )
+
+    return avg_epoch_loss
 
 def save_checkpoint(
     model: FSDP,
