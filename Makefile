@@ -1,6 +1,6 @@
 # Makefile for ManimBOT Training
 
-.PHONY: help test test-all test-local test-modal-basic test-distributed test-wandb test-fsdp train deploy
+.PHONY: help test test-all test-local test-modal-basic test-distributed test-wandb test-fsdp train deploy push-to-hf
 
 help:
 	@echo "ManimBOT Training Commands"
@@ -15,10 +15,12 @@ help:
 	@echo "Training:"
 	@echo "  make train             - Run full training on Modal"
 	@echo "  make deploy            - Deploy Modal app"
+	@echo "  make push-to-hf        - Push trained model to HuggingFace Hub"
 	@echo ""
 	@echo "Setup:"
 	@echo "  make install           - Install dependencies"
 	@echo "  make wandb-secret      - Create WandB secret in Modal"
+	@echo "  make hf-secret         - Create HuggingFace secret in Modal"
 
 # Testing
 test-all:
@@ -58,6 +60,14 @@ deploy:
 	@echo "Deploying Modal app..."
 	@modal deploy src/utils/modal/modal_app.py
 
+push-to-hf:
+	@echo "Pushing model to HuggingFace Hub..."
+	@echo "⚠️  Requires HuggingFace token. Run 'make hf-secret' first."
+	@read -p "HuggingFace repo (e.g., username/model-name): " repo && \
+	 read -p "Checkpoint name [checkpoint_best.pt]: " checkpoint && \
+	 checkpoint=$${checkpoint:-checkpoint_best.pt} && \
+	 modal run src.utils.modal.push_to_hf --checkpoint-name $$checkpoint --hf-repo $$repo
+
 # Setup
 install:
 	@echo "Installing dependencies..."
@@ -68,6 +78,13 @@ wandb-secret:
 	@echo "Enter your WandB API key:"
 	@read -p "API Key: " key && modal secret create wandb-secret WANDB_API_KEY=$$key
 	@echo "✅ WandB secret created!"
+
+hf-secret:
+	@echo "Creating HuggingFace secret in Modal..."
+	@echo "Get your token from: https://huggingface.co/settings/tokens"
+	@echo "Enter your HuggingFace token:"
+	@read -p "HF Token: " token && modal secret create huggingface-secret HF_TOKEN=$$token
+	@echo "✅ HuggingFace secret created!"
 
 # Clean
 clean:

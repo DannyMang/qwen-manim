@@ -26,7 +26,10 @@ image = (
 )
 
 app = modal.App("manimbot-training", image=image)
-volume = modal.Volume.from_name("manimbot-checkpoints", create_if_missing=True)
+
+# Create volumes for checkpoints and profiler logs
+checkpoint_volume = modal.Volume.from_name("manimbot-checkpoints", create_if_missing=True)
+profiler_volume = modal.Volume.from_name("manimbot-profiler-logs", create_if_missing=True)
 
 
 def run_training_worker(rank, world_size, config_path="/root/config/training_config.yaml"):
@@ -54,7 +57,10 @@ def run_training_worker(rank, world_size, config_path="/root/config/training_con
     gpu=f"A100-80GB:{NUM_GPUS}",
     timeout=86400,  # 24 hours
     secrets=[modal.Secret.from_name("wandb-secret")],
-    volumes={"/checkpoints": volume},
+    volumes={
+        "/checkpoints": checkpoint_volume,
+        "/profiler_logs": profiler_volume,
+    },
     retries=3,
 )
 def train():

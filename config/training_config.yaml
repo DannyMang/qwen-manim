@@ -38,7 +38,7 @@ training:
   adam_epsilon: 1.0e-8
 
   # Checkpointing
-  checkpoint_dir: "/checkpoints"  # Modal volume mount point
+  checkpoint_dir: "/checkpoints" # Modal volume mount point
 
 fsdp:
   # From FSDPConfig dataclass
@@ -51,7 +51,7 @@ fsdp:
   buffer_dtype: "bfloat16"
 
   # Memory optimizations
-  cpu_offload: false # Change later
+  cpu_offload: true # Offload optimizer states to CPU (saves ~40GB per GPU)
   use_activation_checkpointing: true
   use_gradient_checkpointing: true
 
@@ -70,11 +70,16 @@ logging:
 
   # Profiling frequency
   profile_every_n_steps: 100
-  profile_enabled: false  # Set to true to enable profiling
+  profiling:
+    enabled: true  # Enable profiler
+    wait: 1        # Wait 1 step before profiling
+    warmup: 2      # Warmup for 2 steps
+    active: 3      # Profile for 3 steps
+    repeat: 2      # Repeat the cycle 2 times
 
   # Checkpointing
-  save_every_n_epochs: 1  # Save after each epoch
-  keep_last_n_checkpoints: 3  # Keep only last 3 checkpoints
+  save_every_n_epochs: 1 # Save after each epoch
+  keep_last_n_checkpoints: 3 # Keep only last 3 checkpoints
 
   # WandB settings
   wandb:

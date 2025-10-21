@@ -103,74 +103,44 @@ def setup_model_and_optimizer(config: dict, rank: int):
     if tokenizer.pad_token is None:
         tokenizer.pad_token_id = config["model"]["pad_token_id"]
 
-    # Step 1: ALL ranks initialize model on meta device (0 memory)
+    # Load model directly (no meta device - Qwen3Next doesn't support it)
     if rank == 0:
-        print(f"\n[Rank 0] Initializing model structure on meta device...")
+        print(f"\n[Rank 0] Loading full model to CPU (this may take 5-10 minutes)...")
 
-    config_obj = AutoConfig.from_pretrained(
+    # All ranks load the model - FSDP will handle sharding
+    # This is the recommended approach for models with custom modules
+    model = AutoModelForCausalLM.from_pretrained(
         model_name,
+        dtype=torch.bfloat16,
         trust_remote_code=True,
+        use_cache=False,
+        low_cpu_mem_usage=True,
     )
 
-    with torch.device("meta"):
-        model = AutoModelForCausalLM.from_config(
-            config_obj,
-            trust_remote_code=True,
-            dtype=torch.bfloat16,
-        )
+    if rank == 0:
+        print(f"[Rank 0] ✅ Model loaded to CPU")
+
+    # Wait for all ranks to finish loading
+    dist.barrier()
 
     if rank == 0:
-        print(f"[Rank 0] ✅ Model structure initialized (0 memory used on all ranks)")
+        print("[Rank 0] Wrapping model with FSDP and sharding across GPUs...")
 
     fsdp_cfg = FSDPConfig(
         use_mixed_precision=config["fsdp"]["use_mixed_precision"],
         cpu_offload=config["fsdp"]["cpu_offload"],
         use_activation_checkpointing=config["fsdp"]["use_activation_checkpointing"],
         use_gradient_checkpointing=config["fsdp"]["use_gradient_checkpointing"],
-        sync_module_states=True,  # Will sync sharded weights from rank 0
+        sync_module_states=True,  # Sync weights from rank 0 to other ranks
     )
-
-    if rank == 0:
-        print("[Rank 0] All ranks: Wrapping model with FSDP...")
 
     model = setup_fsdp_model(model, fsdp_cfg)
 
     if rank == 0:
-        print("[Rank 0] ✅ Model wrapped with FSDP")
+        print("[Rank 0] ✅ Model wrapped with FSDP and sharded (~20GB per GPU)")
 
-    # Step 4: Load weights - FSDP will shard and distribute
-    # Only rank 0 loads from HuggingFace, FSDP broadcasts shards
-    if rank == 0:
-        print("[Rank 0] Loading checkpoint (will be sharded across all ranks)...")
-
-    with FSDP.state_dict_type(
-        model,
-        StateDictType.FULL_STATE_DICT,
-        FullStateDictConfig(offload_to_cpu=True, rank0_only=True),
-    ):
-        if rank == 0:
-            # Rank 0: Load full checkpoint to CPU
-            temp_model = AutoModelForCausalLM.from_pretrained(
-                model_name,
-                dtype=torch.bfloat16,
-                trust_remote_code=True,
-                use_cache=False,
-                low_cpu_mem_usage=True,
-            )
-            state_dict = temp_model.state_dict()
-            del temp_model
-
-            # Load into FSDP model - FSDP handles sharding
-            model.load_state_dict(state_dict)
-            del state_dict
-
-            print("[Rank 0] ✅ Checkpoint loaded, distributing shards to all ranks...")
-
-    # Wait for all ranks to receive their shards
+    # Final barrier to ensure all ranks are ready
     dist.barrier()
-
-    if rank == 0:
-        print(f"[Rank 0] ✅ Model sharded: each rank holds ~20GB")
 
     optimizer = torch.optim.AdamW(
         model.parameters(),
@@ -406,29 +376,32 @@ def train(config_path: str = "config/training_config.yaml"):
         )
 
         profiler = None
-        if config.get("profiling", {}).get("enabled", False):
+        profiling_config = config.get("logging", {}).get("profiling", {})
+        if profiling_config.get("enabled", False):
             if rank == 0:
                 print("[Rank 0] Setting up PyTorch profiler...")
+                print(f"[Rank 0] Profiler will save to: /profiler_logs")
 
             profiler = profile(
                 activities=[ProfilerActivity.CPU, ProfilerActivity.CUDA],
                 schedule=schedule(
-                    wait=1,
-                    warmup=2,
-                    active=3,
-                    repeat=2,
+                    wait=profiling_config.get("wait", 1),
+                    warmup=profiling_config.get("warmup", 2),
+                    active=profiling_config.get("active", 3),
+                    repeat=profiling_config.get("repeat", 2),
                 ),
                 on_trace_ready=torch.profiler.tensorboard_trace_handler(
-                    './profiler_logs'
+                    '/profiler_logs'  # Modal volume location
                 ),
                 record_shapes=True,
-                profile_memory=True,
+                profile_memory=True,  # CRITICAL: Enables memory profiling
                 with_stack=True,
             )
             profiler.start()
 
             if rank == 0:
-                print("[Rank 0] ✅ Profiler enabled")
+                print("[Rank 0] ✅ Profiler enabled (memory tracking active)")
+                print("[Rank 0] Profile cycle: wait=1, warmup=2, active=3, repeat=2")
 
         # Load checkpoint if resuming
         start_epoch = 0
