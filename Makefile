@@ -1,6 +1,6 @@
 # Makefile for ManimBOT Training
 
-.PHONY: help test test-all test-local test-modal-basic test-distributed test-wandb test-fsdp test-smoke train deploy
+.PHONY: help test test-all test-local test-modal-basic test-distributed test-wandb test-fsdp train deploy
 
 help:
 	@echo "ManimBOT Training Commands"
@@ -11,7 +11,6 @@ help:
 	@echo "  make test-distributed  - Phase 2: Distributed setup (\$$0.20)"
 	@echo "  make test-wandb        - Phase 3: WandB logging (\$$0.20)"
 	@echo "  make test-fsdp         - Phase 4: FSDP with GPT2 (\$$0.30)"
-	@echo "  make test-smoke        - Phase 5: Full smoke test (\$$1-2)"
 	@echo ""
 	@echo "Training:"
 	@echo "  make train             - Run full training on Modal"
@@ -45,14 +44,8 @@ test-wandb:
 	@modal run tests/test_modal_wandb.py
 
 test-fsdp:
-	@echo "Running Phase 5: FSDP..."
+	@echo "Running Phase 4: FSDP..."
 	@modal run tests/test_modal_fsdp.py
-
-test-smoke:
-	@echo "Running Phase 6: Full smoke test..."
-	@echo "⚠️  WARNING: Loads full 80B model. Cost: ~\$$1-2, Time: 15 min"
-	@read -p "Continue? (y/n): " confirm && [ $$confirm = "y" ] || exit 1
-	@modal run tests/test_modal_full_smoke.py
 
 # Training
 train:

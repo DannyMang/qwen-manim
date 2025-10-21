@@ -38,13 +38,6 @@ TESTS = [
         "time": "5 min",
         "required": True,
     },
-    {
-        "name": "Phase 5: Full Smoke Test",
-        "command": ["modal", "run", "tests/test_modal_full_smoke.py"],
-        "cost": "$1-2",
-        "time": "15 min",
-        "required": False,  # Optional - expensive
-    },
 ]
 
 
@@ -90,8 +83,8 @@ def main():
     print("ManimBOT Master Test Suite")
     print("="*80)
     print(f"\nTotal tests: {len(TESTS)}")
-    print(f"Estimated time: ~25 minutes")
-    print(f"Estimated cost: ~$0.71 (required) + $1-2 (optional smoke test)")
+    print(f"Estimated time: ~15 minutes")
+    print(f"Estimated cost: ~$0.71")
     print("\n" + "="*80)
 
     response = input("\nRun all tests? (y/n): ")

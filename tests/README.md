@@ -12,7 +12,7 @@ Incremental testing plan to verify everything works before running full training
 python tests/run_all_tests.py
 ```
 
-This will run all 5 test phases sequentially and give you a summary.
+This will run all 4 test phases sequentially and give you a summary.
 
 ### Option 2: Run Tests Individually
 
@@ -154,69 +154,9 @@ modal run tests/test_modal_fsdp.py
 
 ---
 
-### Phase 5: Full Smoke Test (~ $1-2, 10-15 min) ⚠️
-
-**What it tests:**
-- Full Qwen3-Next-80B model loading
-- FSDP sharding (160GB → 20GB per GPU)
-- Manim dataset loading
-- Actual training step
-- WandB logging
-- Checkpoint saving to volume
-
-**Cost:** ~$1-2
-**Time:** 10-15 minutes
-**Prerequisites:**
-```bash
-# Ensure WandB secret exists
-modal secret list | grep wandb-secret
-
-# Ensure checkpoint volume exists
-modal volume list | grep manimbot-checkpoints
-```
-
-**Run:**
-```bash
-modal run tests/test_modal_full_smoke.py
-```
-
-**Expected output:**
-```
-✅ Step 1: Loading model (this may take 5-10 minutes)...
-  ✅ Model loaded and sharded
-
-✅ Step 2: Creating optimizer...
-
-✅ Step 3: Loading data...
-
-✅ Step 4: Initializing WandB...
-
-✅ Step 5: Running 1 training step...
-  Loss: 3.2145
-  ✅ Training step completed
-
-✅ Step 6: Saving checkpoint...
-  ✅ Checkpoint saved: /checkpoints/checkpoint_epoch_1.pt
-
-🎉 SMOKE TEST PASSED!
-All systems working:
-  ✅ Model loading
-  ✅ FSDP sharding
-  ✅ Data loading
-  ✅ Training step
-  ✅ WandB logging
-  ✅ Checkpointing
-```
-
-**Verify:**
-1. Check WandB dashboard: `manimbot-test/smoke-test-run`
-2. Check Modal volumes: `modal volume list`
-
----
-
 ## 🚀 After All Tests Pass
 
-Once all 6 phases pass, you're ready for full training:
+Once all 4 phases pass, you're ready for full training:
 
 ```bash
 # Full training run
@@ -233,8 +173,7 @@ modal run src.utils.modal.modal_app::train
 | 2. Distributed | 5 min | $0.20 | 8x GPU + NCCL |
 | 3. WandB | 3 min | $0.20 | Logging |
 | 4. FSDP | 5 min | $0.30 | Model training |
-| 5. Smoke test | 15 min | $1-2 | Full integration |
-| **TOTAL** | **~30 min** | **~$1.71-$2.71** | Everything |
+| **TOTAL** | **~15 min** | **~$0.71** | Everything |
 
 ---
 
@@ -279,7 +218,6 @@ Before running full training, all tests should show:
 - ✅ WandB logging from rank 0
 - ✅ FSDP forward/backward working
 - ✅ Checkpoints saving to volume
-- ✅ Training loss decreasing (smoke test only)
 
 ---
 
@@ -288,5 +226,4 @@ Before running full training, all tests should show:
 1. **Run tests in order** - each builds on previous
 2. **Check Modal dashboard** - monitor GPU usage
 3. **Check WandB dashboard** - verify logging
-4. **Keep smoke test output** - useful for debugging full run
-5. **Cost conscious?** - Skip phase 5 (smoke test), go straight to full training after phase 4
+4. **All tests pass?** - You're ready for full training!

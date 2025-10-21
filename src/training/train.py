@@ -27,12 +27,16 @@ from src.utils.checkpoint import save_checkpoint, load_checkpoint
 
 def setup_distributed():
     """
-    inititializes distributed training environment
+    Initializes distributed training environment.
+    Assumes RANK, WORLD_SIZE, MASTER_ADDR, MASTER_PORT are set by torch.multiprocessing.spawn or torchrun.
     """
-    dist.init_process_group(backend="nccl")
-    rank=dist.get_rank()
-    world_size=dist.get_world_size()
-    local_rank=int(os.environ.get("LOCAL_RANK",0))
+    # Get rank info from environment
+    rank = int(os.environ.get("RANK", 0))
+    world_size = int(os.environ.get("WORLD_SIZE", 1))
+    local_rank = int(os.environ.get("LOCAL_RANK", rank))
+
+    # Initialize process group with explicit rank/world_size (like in tests)
+    dist.init_process_group(backend="nccl", rank=rank, world_size=world_size)
 
     torch.cuda.set_device(local_rank)
 
@@ -41,7 +45,7 @@ def setup_distributed():
         torch.cuda.manual_seed(42+rank)
 
     if rank == 0:
-        print(f"Initialized distributed training: world_size={world_size}")
+        print(f"[Rank 0] Initialized distributed training: world_size={world_size}")
 
     return rank, world_size, local_rank
 
@@ -62,18 +66,34 @@ def setup_model_and_optimizer(config: dict, rank: int):
     Load Qwen3-Next model and wrap with FSDP with efficient sharding.
 
     Sharded loading approach:
-    1. ALL ranks: Initialize model on meta device (0 memory)
-    2. ALL ranks: Wrap with FSDP
-    3. Rank 0: Load checkpoint to CPU, FSDP distributes shards to all ranks
-    4. Each rank: Receives and materializes only its shard (~20GB)
+    1. Rank 0: Download model config and tokenizer to cache (prevents race conditions)
+    2. ALL ranks: Initialize model on meta device (0 memory)
+    3. ALL ranks: Wrap with FSDP
+    4. Rank 0: Load checkpoint to CPU, FSDP distributes shards to all ranks
+    5. Each rank: Receives and materializes only its shard (~20GB)
 
     Peak memory per rank: ~30-40GB (20GB params + optimizer states)
     """
     model_name = config["model"]["name"]
 
     if rank == 0:
-        print(f"Loading model: {model_name}")
+        print(f"[Rank 0] Loading model: {model_name}")
 
+    # Download config and tokenizer on rank 0 FIRST to avoid race conditions
+    if rank == 0:
+        print(f"[Rank 0] Downloading model config and tokenizer...")
+        # Force download by loading once
+        _ = AutoConfig.from_pretrained(model_name, trust_remote_code=True)
+        _ = AutoTokenizer.from_pretrained(model_name, trust_remote_code=True, use_fast=True)
+        print(f"[Rank 0] Download complete")
+
+    # Wait for rank 0 to finish downloading
+    dist.barrier()
+
+    if rank != 0:
+        print(f"[Rank {rank}] Rank 0 download complete, proceeding...")
+
+    # Now all ranks can safely load from cache
     tokenizer = AutoTokenizer.from_pretrained(
         model_name,
         trust_remote_code=True,
@@ -85,7 +105,7 @@ def setup_model_and_optimizer(config: dict, rank: int):
 
     # Step 1: ALL ranks initialize model on meta device (0 memory)
     if rank == 0:
-        print("All ranks: Initializing model structure on meta device...")
+        print(f"\n[Rank 0] Initializing model structure on meta device...")
 
     config_obj = AutoConfig.from_pretrained(
         model_name,
@@ -96,11 +116,11 @@ def setup_model_and_optimizer(config: dict, rank: int):
         model = AutoModelForCausalLM.from_config(
             config_obj,
             trust_remote_code=True,
-            torch_dtype=torch.bfloat16,
+            dtype=torch.bfloat16,
         )
 
     if rank == 0:
-        print(f"✅ Model structure initialized (0 memory used on all ranks)")
+        print(f"[Rank 0] ✅ Model structure initialized (0 memory used on all ranks)")
 
     fsdp_cfg = FSDPConfig(
         use_mixed_precision=config["fsdp"]["use_mixed_precision"],
@@ -111,17 +131,17 @@ def setup_model_and_optimizer(config: dict, rank: int):
     )
 
     if rank == 0:
-        print("All ranks: Wrapping model with FSDP...")
+        print("[Rank 0] All ranks: Wrapping model with FSDP...")
 
     model = setup_fsdp_model(model, fsdp_cfg)
 
     if rank == 0:
-        print("✅ Model wrapped with FSDP")
+        print("[Rank 0] ✅ Model wrapped with FSDP")
 
     # Step 4: Load weights - FSDP will shard and distribute
     # Only rank 0 loads from HuggingFace, FSDP broadcasts shards
     if rank == 0:
-        print("Rank 0: Loading checkpoint (will be sharded across all ranks)...")
+        print("[Rank 0] Loading checkpoint (will be sharded across all ranks)...")
 
     with FSDP.state_dict_type(
         model,
@@ -132,7 +152,7 @@ def setup_model_and_optimizer(config: dict, rank: int):
             # Rank 0: Load full checkpoint to CPU
             temp_model = AutoModelForCausalLM.from_pretrained(
                 model_name,
-                torch_dtype=torch.bfloat16,
+                dtype=torch.bfloat16,
                 trust_remote_code=True,
                 use_cache=False,
                 low_cpu_mem_usage=True,
@@ -144,13 +164,13 @@ def setup_model_and_optimizer(config: dict, rank: int):
             model.load_state_dict(state_dict)
             del state_dict
 
-            print("✅ Checkpoint loaded, distributing shards to all ranks...")
+            print("[Rank 0] ✅ Checkpoint loaded, distributing shards to all ranks...")
 
     # Wait for all ranks to receive their shards
     dist.barrier()
 
     if rank == 0:
-        print(f"✅ Model sharded: each rank holds ~20GB")
+        print(f"[Rank 0] ✅ Model sharded: each rank holds ~20GB")
 
     optimizer = torch.optim.AdamW(
         model.parameters(),
@@ -161,7 +181,7 @@ def setup_model_and_optimizer(config: dict, rank: int):
     )
 
     if rank == 0:
-        print("✅ Optimizer created")
+        print("[Rank 0] ✅ Optimizer created")
 
     return model, optimizer, tokenizer
 
@@ -341,7 +361,7 @@ def train(config_path: str = "config/training_config.yaml"):
         model, optimizer, tokenizer = setup_model_and_optimizer(config, rank)
 
         if rank == 0:
-            print("Setting up data loader...")
+            print("[Rank 0] Setting up data loader...")
 
         dataloader = get_dataloader(
             tokenizer=tokenizer,
@@ -352,7 +372,7 @@ def train(config_path: str = "config/training_config.yaml"):
         )
 
         if rank == 0:
-            print(f"✅ Data loader ready")
+            print(f"[Rank 0] ✅ Data loader ready")
 
         num_training_steps = (
             len(dataloader) //
@@ -367,7 +387,7 @@ def train(config_path: str = "config/training_config.yaml"):
         )
 
         if rank == 0:
-            print(f"✅ Scheduler ready ({num_training_steps} steps)")
+            print(f"[Rank 0] ✅ Scheduler ready ({num_training_steps} steps)")
 
         # Setup WandB logging (rank 0 only)
         logger = None
@@ -378,7 +398,7 @@ def train(config_path: str = "config/training_config.yaml"):
                 config=config,
                 tags=config["logging"]["wandb"].get("tags", []),
             )
-            print("✅ WandB initialized")
+            print("[Rank 0] ✅ WandB initialized")
 
         metrics = TrainingMetrics(
             log_grad_norm=True,
@@ -388,7 +408,7 @@ def train(config_path: str = "config/training_config.yaml"):
         profiler = None
         if config.get("profiling", {}).get("enabled", False):
             if rank == 0:
-                print("Setting up PyTorch profiler...")
+                print("[Rank 0] Setting up PyTorch profiler...")
 
             profiler = profile(
                 activities=[ProfilerActivity.CPU, ProfilerActivity.CUDA],
@@ -408,7 +428,7 @@ def train(config_path: str = "config/training_config.yaml"):
             profiler.start()
 
             if rank == 0:
-                print("✅ Profiler enabled")
+                print("[Rank 0] ✅ Profiler enabled")
 
         # Load checkpoint if resuming
         start_epoch = 0
@@ -476,12 +496,12 @@ def train(config_path: str = "config/training_config.yaml"):
         if profiler is not None:
             profiler.stop()
             if rank == 0:
-                print("✅ Profiler stopped")
+                print("[Rank 0] ✅ Profiler stopped")
 
         # Finish WandB
         if rank == 0 and logger:
             logger.finish()
-            print("✅ WandB finished")
+            print("[Rank 0] ✅ WandB finished")
 
         if rank == 0:
             print("\n" + "="*80)
@@ -497,7 +517,7 @@ def train(config_path: str = "config/training_config.yaml"):
     finally:
         cleanup_distributed()
         if rank == 0:
-            print("Distributed training cleaned up")
+            print("[Rank 0] Distributed training cleaned up")
 
 
 if __name__ == "__main__":

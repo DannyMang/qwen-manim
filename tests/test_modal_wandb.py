@@ -21,32 +21,24 @@ image = (
 app = modal.App("manimbot-test-wandb", image=image)
 
 
-@app.function(
-    gpu=modal.gpu.A100(count=NUM_GPUS),
-    timeout=600,
-    secrets=[modal.Secret.from_name("wandb-secret")],
-)
-def test_wandb_logging():
+def run_wandb_worker(rank, world_size):
     """
-    Test WandB logging with distributed training (only rank 0 logs).
+    Worker function for WandB test (spawned per GPU).
     """
     import os
     import torch
     import torch.distributed as dist
     import wandb
 
-    print("\n" + "="*80)
-    print("Testing WandB Logging on Modal")
-    print("="*80)
+    # Set up environment
+    os.environ['MASTER_ADDR'] = 'localhost'
+    os.environ['MASTER_PORT'] = '29500'
 
     # Initialize distributed
-    dist.init_process_group(backend="nccl")
-    rank = dist.get_rank()
-    world_size = dist.get_world_size()
-    local_rank = int(os.environ.get("LOCAL_RANK", 0))
-    torch.cuda.set_device(local_rank)
+    dist.init_process_group(backend="nccl", rank=rank, world_size=world_size)
+    torch.cuda.set_device(rank)
 
-    print(f"\nRank {rank}/{world_size} initialized")
+    print(f"\n[Rank {rank}] Initialized on cuda:{rank}")
 
     # Test WandB (only rank 0)
     if rank == 0:
@@ -89,7 +81,7 @@ def test_wandb_logging():
         print(f"  ✅ WandB run finished successfully!")
 
     else:
-        print(f"\nRank {rank}: Skipping WandB (not rank 0)")
+        print(f"\n[Rank {rank}] Skipping WandB (not rank 0)")
 
     # Barrier
     dist.barrier()
@@ -101,7 +93,39 @@ def test_wandb_logging():
         print("\n" + "="*80)
         print("🎉 WandB test PASSED!")
         print("="*80)
-        return "success"
+
+
+@app.function(
+    gpu=f"A100-80GB:{NUM_GPUS}",
+    timeout=600,
+    secrets=[modal.Secret.from_name("wandb-secret")],
+)
+def test_wandb_logging():
+    """
+    Test WandB logging with distributed training (only rank 0 logs).
+    """
+    import torch
+    import torch.multiprocessing as mp
+
+    print("\n" + "="*80)
+    print("Testing WandB Logging on Modal")
+    print("="*80)
+
+    # Test GPU availability
+    print(f"\n✅ GPU Test:")
+    print(f"  CUDA available: {torch.cuda.is_available()}")
+    print(f"  GPU count: {torch.cuda.device_count()}")
+
+    # Spawn NUM_GPUS processes, one for each GPU
+    print(f"\n✅ Spawning {NUM_GPUS} processes for distributed WandB test...")
+    mp.spawn(
+        run_wandb_worker,
+        args=(NUM_GPUS,),
+        nprocs=NUM_GPUS,
+        join=True
+    )
+
+    return "success"
 
 
 @app.local_entrypoint()
