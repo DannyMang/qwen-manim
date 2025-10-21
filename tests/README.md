@@ -99,7 +99,7 @@ modal run tests/test_modal_wandb.py
 **Expected output:**
 ```
 ✅ WandB Test (Rank 0):
-  API key found: 83f9e40c16...
+  API key found: <your_key>...
   WandB run: wandb-test-run
   WandB URL: https://wandb.ai/...
   Logged 5 test steps
@@ -252,7 +252,7 @@ export PYTHONPATH="${PYTHONPATH}:$(pwd)"
 **Fix:**
 ```bash
 # Create Modal secret
-modal secret create wandb-secret WANDB_API_KEY=83f9e40c161ab1a3d3b7d17b4a242ac102215178
+modal secret create wandb-secret WANDB_API_KEY=your_wandb_api_key_here
 ```
 
 ### Issue: "torch version 2.9.0 not found"
