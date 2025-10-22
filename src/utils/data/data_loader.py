@@ -103,10 +103,11 @@ class StreamingManimDataset(IterableDataset):
     Wraps huggingface streaming dataset for PyTorch dataloader with automatic distributed sharding
     """
 
-    def __init__(self, hf_dataset, tokenizer, max_length=2048):
+    def __init__(self, hf_dataset, tokenizer, max_length=2048, total_examples=7622):
         self.dataset = hf_dataset
         self.tokenizer = tokenizer
         self.max_length = max_length
+        self.total_examples = total_examples
 
         if self.tokenizer.pad_token is None:
             self.tokenizer.pad_token = self.tokenizer.eos_token
@@ -118,6 +119,13 @@ class StreamingManimDataset(IterableDataset):
             # Single GPU fallback
             self.rank = 0
             self.world_size = 1
+
+    def __len__(self):
+        """
+        Return approximate number of examples for this rank.
+        Since we use modulo-based sharding, each rank gets ~total_examples/world_size
+        """
+        return self.total_examples // self.world_size
 
     def __iter__(self):
         for idx, example in enumerate(self.dataset):
@@ -139,7 +147,7 @@ class StreamingManimDataset(IterableDataset):
                 "labels": encoded["input_ids"].squeeze(0),
             }
 
-def get_dataloader(tokenizer, batch_size=4, max_length=2048, streaming=True, num_workers=0):
+def get_dataloader(tokenizer, batch_size=4, max_length=2048, streaming=True, num_workers=0, total_examples=7622):
     """
     Get PyTorch dataloader with automatic sharding for FSDP.
 
@@ -149,12 +157,13 @@ def get_dataloader(tokenizer, batch_size=4, max_length=2048, streaming=True, num
         max_length: Max sequence length
         streaming: Whether to use streaming mode
         num_workers: Number of data loading workers (must be 0 for streaming)
+        total_examples: Total number of examples in the dataset (default 7622)
 
     Returns:
         PyTorch DataLoader with automatic rank-based sharding
     """
     hf_dataset = load_all_datasets(streaming=streaming)
-    dataset = StreamingManimDataset(hf_dataset, tokenizer, max_length)
+    dataset = StreamingManimDataset(hf_dataset, tokenizer, max_length, total_examples)
     loader = DataLoader(
         dataset,
         batch_size=batch_size,
